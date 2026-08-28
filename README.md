@@ -24,7 +24,4 @@ Bash-скрипт для настройки TCP/UDP-пробросов чере�
 ## Установка
 
 ```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
-cd REPOSITORY
-chmod +x setup.sh
-sudo ./setup.sh
+curl -fsSL https://raw.githubusercontent.com/Not2Clean/relay_manager/refs/heads/main/relay_install.bash | sudo bash
