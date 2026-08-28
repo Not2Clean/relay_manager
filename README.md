@@ -24,4 +24,7 @@ Bash-скрипт для настройки TCP/UDP-пробросов чере�
 ## Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Not2Clean/relay_manager/refs/heads/main/relay_install.bash | sudo bash
+sudo curl -fsSL https://raw.githubusercontent.com/Not2Clean/relay_manager/main/relay_install.bash \
+  -o /usr/local/sbin/relay-manager && \
+sudo chmod 755 /usr/local/sbin/relay-manager && \
+sudo relay-manager
