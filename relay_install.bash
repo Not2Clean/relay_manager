@@ -19,13 +19,17 @@ C_DIM='\033[2m'
 CONF_DIR="/etc/relay-manager"
 RELAYS_FILE="$CONF_DIR/relays.list"          # формат строки: LPORT:BIP:BPORT:PROTO (PROTO=tcp|udp|both)
 ENV_FILE="$CONF_DIR/config.env"
+EXTRA_PORTS_FILE="$CONF_DIR/extra_allowed_ports.list"   # порты сторонних служб, которым явно разрешён вход
+INIT_MARKER="$CONF_DIR/.initialized"
 SWAP_FILE="/swapfile"
 BACKUP_DIR="/root/iptables-backups"
+PRISTINE_V4="$BACKUP_DIR/pristine.v4"
+PRISTINE_V6="$BACKUP_DIR/pristine.v6"
 IP_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 PORT_REGEX='^[0-9]{1,5}$'
 
 # Имена выделенных цепочек — весь трафик relay-manager живёт только здесь.
-# Это принципиально: скрипт больше НЕ делает `iptables -F` по базовым таблицам
+# Это принципиально: скрипт не делает `iptables -F` по базовым таблицам
 # и не трогает правила Docker/UFW/firewalld/fail2ban/VPN.
 CHAIN_NAT_PRE="RELAY-PREROUTING"
 CHAIN_NAT_POST="RELAY-POSTROUTING"
@@ -55,7 +59,23 @@ pause() {
 }
 
 # ------------------------------------------------------------------------------
-# Валидация IPv4 по диапазону октетов (было: только структура через regex)
+# Безопасно записывает/обновляет одну переменную в ENV_FILE, не затирая остальные
+# (раньше файл целиком перезаписывался при каждом сохранении SSH_PORT, из-за
+# чего терялись бы сохранённые "исходные" политики firewall).
+# ------------------------------------------------------------------------------
+set_env_var() {
+    local key="$1" value="$2"
+    touch "$ENV_FILE"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+    else
+        echo "${key}=${value}" >> "$ENV_FILE"
+    fi
+    chmod 600 "$ENV_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Валидация IPv4 по диапазону октетов
 # ------------------------------------------------------------------------------
 valid_ipv4() {
     local ip="$1" IFS=. a b c d
@@ -70,6 +90,38 @@ valid_ipv4() {
         return 1
     fi
     return 0
+}
+
+# Читает текущую политику по умолчанию для цепочки (ACCEPT/DROP), безопасно
+# для `set -e` — при любой ошибке просто вернёт пустую строку.
+get_policy() {
+    local cmd="$1" chain="$2" pol=""
+    pol=$("$cmd" -S "$chain" 2>/dev/null | head -n1 | awk '{print $3}') || true
+    echo "$pol"
+}
+
+# ------------------------------------------------------------------------------
+# Сохраняет состояние firewall ДО первого вмешательства скрипта — только один
+# раз. Без этого "полное удаление" не знало бы, к каким политикам возвращаться.
+# ------------------------------------------------------------------------------
+save_pristine_state() {
+    if [[ -f "$INIT_MARKER" ]]; then
+        return 0
+    fi
+
+    echo -e "${C_DIM}Сохраняю исходное состояние firewall (нужно для последующего полного удаления)...${C_RESET}"
+
+    set_env_var ORIG_INPUT_POLICY   "$(get_policy iptables INPUT)"
+    set_env_var ORIG_FORWARD_POLICY "$(get_policy iptables FORWARD)"
+    set_env_var ORIG_OUTPUT_POLICY  "$(get_policy iptables OUTPUT)"
+    set_env_var ORIG6_INPUT_POLICY   "$(get_policy ip6tables INPUT)"
+    set_env_var ORIG6_FORWARD_POLICY "$(get_policy ip6tables FORWARD)"
+    set_env_var ORIG6_OUTPUT_POLICY  "$(get_policy ip6tables OUTPUT)"
+
+    [[ -f "$PRISTINE_V4" ]] || iptables-save  > "$PRISTINE_V4" 2>/dev/null || true
+    [[ -f "$PRISTINE_V6" ]] || ip6tables-save > "$PRISTINE_V6" 2>/dev/null || true
+
+    touch "$INIT_MARKER"
 }
 
 init_system() {
@@ -137,8 +189,7 @@ load_or_ask_ssh_port() {
             INPUT_SSH="${INPUT_SSH:-$DEFAULT_SSH_PORT}"
             if [[ "$INPUT_SSH" =~ $PORT_REGEX ]] && (( INPUT_SSH >= 1 && INPUT_SSH <= 65535 )); then
                 SSH_PORT="$INPUT_SSH"
-                echo "SSH_PORT=$SSH_PORT" > "$ENV_FILE"
-                chmod 600 "$ENV_FILE"
+                set_env_var SSH_PORT "$SSH_PORT"
                 break
             fi
             echo -e "${C_RED}✖ Некорректный порт. Попробуй ещё раз.${C_RESET}"
@@ -147,14 +198,110 @@ load_or_ask_ssh_port() {
 }
 
 # ------------------------------------------------------------------------------
+# Ищет порты, на которых слушают ЧУЖИЕ службы (не SSH и не relay-входы).
+# Печатает строки "PROTO PORT PROCESS". Это эвристика поверх `ss`, не идеальная,
+# но покрывает основной случай — прямые сервисы вроде Xray/nginx на хосте.
+# ------------------------------------------------------------------------------
+list_foreign_listeners() {
+    local relay_ports
+    relay_ports=$(awk -F: '$0 !~ /^#/ && NF>=1 && length($1)>0 {print $1}' "$RELAYS_FILE" 2>/dev/null | sort -u)
+
+    { ss -Htlnp 2>/dev/null | awk '{print "TCP", $4, $6}'
+      ss -Hulnp 2>/dev/null | awk '{print "UDP", $4, $6}'
+    } | while read -r proto laddr proc; do
+        local port="${laddr##*:}"
+        [[ "$laddr" == 127.0.0.1:* || "$laddr" == "[::1]:"* ]] && continue
+        [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && continue
+        [[ "$port" == "${SSH_PORT:-}" ]] && continue
+        if echo "$relay_ports" | grep -qx "$port"; then continue; fi
+        printf '%s %s %s\n' "$proto" "$port" "${proc:-неизвестно}"
+    done | sort -u -k2,2n
+}
+
+# ------------------------------------------------------------------------------
+# Перед включением DROP-политики предупреждает о сторонних службах, которые
+# иначе окажутся отрезаны от внешнего мира. Возвращает:
+#   0 — можно жёстко блокировать (конфликтов нет либо пользователь их разрешил)
+#   1 — пользователь попросил НЕ включать блокировку в этом запуске
+#   2 — пользователь отменил операцию полностью
+# ------------------------------------------------------------------------------
+confirm_lockdown_or_skip() {
+    local conflicts
+    conflicts="$(list_foreign_listeners)"
+
+    [[ -z "$conflicts" ]] && return 0
+
+    local pending=()
+    while read -r proto port proc; do
+        [[ -z "$proto" ]] && continue
+        if [[ -f "$EXTRA_PORTS_FILE" ]] && grep -qx "${port}:${proto,,}" "$EXTRA_PORTS_FILE" 2>/dev/null; then
+            continue
+        fi
+        pending+=("$proto $port $proc")
+    done <<< "$conflicts"
+
+    (( ${#pending[@]} == 0 )) && return 0
+
+    print_header
+    echo -e "${C_RED}⚠ ВНИМАНИЕ: обнаружены другие службы, слушающие порты, не связанные с relay-manager:${C_RESET}"
+    echo ""
+    printf '  %-6s %-8s %s\n' "ПРОТО" "ПОРТ" "ПРОЦЕСС"
+    local line p port proc
+    for line in "${pending[@]}"; do
+        read -r p port proc <<< "$line"
+        printf "  ${C_YELLOW}%-6s %-8s${C_RESET} %s\n" "$p" "$port" "$proc"
+    done
+    echo ""
+    echo -e "${C_RED}Если продолжить с жёсткой блокировкой (INPUT/FORWARD DROP по умолчанию),${C_RESET}"
+    echo -e "${C_RED}эти службы станут недоступны снаружи — для них нет разрешающих правил.${C_RESET}"
+    echo ""
+    echo -e "${C_BOLD}Что делать?${C_RESET}"
+    echo -e " ${C_GREEN}1)${C_RESET} Разрешить входящие подключения на эти порты и продолжить блокировку (рекомендуется)"
+    echo -e " ${C_YELLOW}2)${C_RESET} Не включать жёсткую блокировку сейчас (INPUT/FORWARD останутся как есть)"
+    echo -e " ${C_RED}3)${C_RESET} Отмена — ничего не менять в этом запуске"
+    echo ""
+    read -rp "$(echo -e "${C_BOLD}Выбери [1-3]: ${C_RESET}")" LOCK_CHOICE
+
+    case "$LOCK_CHOICE" in
+        1)
+            touch "$EXTRA_PORTS_FILE"
+            for line in "${pending[@]}"; do
+                read -r p port proc <<< "$line"
+                local pl="${p,,}"
+                iptables  -C INPUT -p "$pl" --dport "$port" -j ACCEPT 2>/dev/null || \
+                    iptables  -A INPUT -p "$pl" --dport "$port" -j ACCEPT
+                ip6tables -C INPUT -p "$pl" --dport "$port" -j ACCEPT 2>/dev/null || \
+                    ip6tables -A INPUT -p "$pl" --dport "$port" -j ACCEPT
+                echo "${port}:${pl}" >> "$EXTRA_PORTS_FILE"
+            done
+            sort -u -o "$EXTRA_PORTS_FILE" "$EXTRA_PORTS_FILE"
+            echo -e "${C_GREEN}✔ Порты разрешены, продолжаю настройку блокировки.${C_RESET}"
+            sleep 1
+            return 0
+            ;;
+        2)
+            echo -e "${C_YELLOW}⚠ Жёсткая блокировка НЕ включена в этом запуске.${C_RESET}"
+            echo -e "${C_YELLOW}  Relay-пробросы и базовые правила (SSH/lo/established) всё равно будут добавлены.${C_RESET}"
+            sleep 2
+            return 1
+            ;;
+        *)
+            echo -e "${C_RED}Отмена. Firewall не изменён.${C_RESET}"
+            sleep 1
+            return 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
 # БАЗОВЫЙ ФАЙРВОЛ — выполняется идемпотентно и ОТДЕЛЬНО от пересборки relay-правил.
-# Здесь и только здесь меняются политики цепочек, поэтому именно здесь стоит
-# критический риск потери SSH-доступа. Порядок жёстко фиксирован:
+# Здесь и только здесь меняются политики цепочек. Порядок жёстко фиксирован:
 #   1) создать резервную копию текущего состояния
 #   2) добавить ACCEPT-правило для SSH ДО того, как выставится политика DROP
-#   3) обернуть весь блок в trap ERR, который откатывает backup при любой ошибке
-# Если что-то в блоке падает — trap восстанавливает состояние ДО начала изменений,
-# то есть либо всё применится целиком, либо ничего не изменится вообще.
+#   3) предупредить о сторонних службах, которые иначе будут отрезаны (НОВОЕ)
+#   4) обернуть блок в trap ERR, который откатывает backup при любой ошибке
+# Возвращает 0 при полном успехе, 1 если блокировка пропущена по решению
+# пользователя, 2 если пользователь всё отменил (состояние откатывается).
 # ------------------------------------------------------------------------------
 setup_base_firewall() {
     echo -e "${C_YELLOW}⚙ Проверка базовой конфигурации firewall...${C_RESET}"
@@ -168,7 +315,7 @@ setup_base_firewall() {
     rollback_base() {
         if (( rollback_done == 1 )); then return; fi
         rollback_done=1
-        echo -e "${C_RED}✖ Ошибка при настройке базового firewall — откатываю к предыдущему состоянию...${C_RESET}" >&2
+        echo -e "${C_RED}✖ Откатываю к состоянию до этого запуска...${C_RESET}" >&2
         iptables-restore < "$backup_v4" 2>/dev/null || true
         ip6tables-restore < "$backup_v6" 2>/dev/null || true
         echo -e "${C_YELLOW}Состояние восстановлено. Ничего не потеряно.${C_RESET}" >&2
@@ -186,7 +333,7 @@ setup_base_firewall() {
     iptables -t nat -N "$CHAIN_NAT_POST" 2>/dev/null || true
     iptables -N "$CHAIN_FWD" 2>/dev/null || true
 
-    # Прописываем jump в наши цепочки один раз (проверяем наличие перед добавлением)
+    # Прописываем jump в наши цепочки один раз
     iptables -t nat -C PREROUTING -j "$CHAIN_NAT_PRE" 2>/dev/null || \
         iptables -t nat -A PREROUTING -j "$CHAIN_NAT_PRE"
     iptables -t nat -C POSTROUTING -j "$CHAIN_NAT_POST" 2>/dev/null || \
@@ -195,8 +342,6 @@ setup_base_firewall() {
         iptables -A FORWARD -j "$CHAIN_FWD"
 
     # Базовые правила INPUT: loopback, established/related, SSH.
-    # Проверяем существование перед добавлением, чтобы не плодить дубликаты
-    # при повторных запусках скрипта.
     iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || \
         iptables -A INPUT -i lo -j ACCEPT
     iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
@@ -207,16 +352,11 @@ setup_base_firewall() {
     iptables -C FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-    # Жёсткая проверка перед закрытием: правило для текущего SSH-порта
-    # действительно есть в таблице. Если нет — обрываем ДО смены политики.
     if ! iptables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null; then
         echo -e "${C_RED}✖ Не удалось подтвердить ACCEPT-правило для SSH-порта $SSH_PORT. Отмена.${C_RESET}" >&2
         false
     fi
 
-    # IPv6: не блокируем полностью, а разрешаем базовый безопасный минимум,
-    # чтобы не сломать ICMPv6 (без него может деградировать IPv6-связность
-    # и диагностика даже при отсутствии IPv6-сервисов).
     ip6tables -P INPUT ACCEPT
     ip6tables -P FORWARD ACCEPT
     ip6tables -P OUTPUT ACCEPT
@@ -228,23 +368,38 @@ setup_base_firewall() {
     ip6tables -C INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null || \
         ip6tables -A INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
 
-    # Только теперь, когда SSH-правило подтверждено, закрываем политику по умолчанию.
-    iptables -P INPUT DROP
-    iptables -P FORWARD DROP
-    iptables -P OUTPUT ACCEPT
-
-    ip6tables -P INPUT DROP
-    ip6tables -P FORWARD DROP
-    ip6tables -P OUTPUT ACCEPT
-
+    # Снимаем ловушку ошибок на время интерактивного диалога — read/меню сами
+    # по себе не являются "ошибками", которые нужно откатывать.
     trap - ERR
-    echo -e "${C_GREEN}✔ Базовый firewall настроен, SSH-доступ подтверждён.${C_RESET}"
+
+    local lockdown_choice=0
+    confirm_lockdown_or_skip || lockdown_choice=$?
+
+    if (( lockdown_choice == 2 )); then
+        rollback_base
+        return 2
+    fi
+
+    trap rollback_base ERR
+    if (( lockdown_choice == 0 )); then
+        iptables -P INPUT DROP
+        iptables -P FORWARD DROP
+        iptables -P OUTPUT ACCEPT
+        ip6tables -P INPUT DROP
+        ip6tables -P FORWARD DROP
+        ip6tables -P OUTPUT ACCEPT
+        echo -e "${C_GREEN}✔ Базовый firewall настроен (жёсткая блокировка активна), SSH-доступ подтверждён.${C_RESET}"
+    else
+        echo -e "${C_DIM}Политики INPUT/FORWARD оставлены без изменений по решению пользователя.${C_RESET}"
+    fi
+    trap - ERR
+
+    return "$lockdown_choice"
 }
 
 # ------------------------------------------------------------------------------
-# Пересборка ТОЛЬКО relay-правил в выделенных цепочках.
-# Не трогает INPUT/политику/чужие правила вообще — безопасно вызывать
-# на каждое добавление/удаление relay.
+# Пересборка ТОЛЬКО relay-правил в выделенных цепочках. Не трогает
+# INPUT/политику/чужие правила вообще.
 # ------------------------------------------------------------------------------
 apply_relay_rules() {
     echo -e "${C_YELLOW}⚙ Применение relay-правил...${C_RESET}"
@@ -262,7 +417,6 @@ apply_relay_rules() {
     }
     trap rollback_relay ERR
 
-    # Чистим только свои цепочки — INPUT/FORWARD/OUTPUT и чужие правила не задеты
     iptables -t nat -F "$CHAIN_NAT_PRE"
     iptables -t nat -F "$CHAIN_NAT_POST"
     iptables -F "$CHAIN_FWD"
@@ -277,7 +431,7 @@ apply_relay_rules() {
                 tcp)  protos=("tcp") ;;
                 udp)  protos=("udp") ;;
                 both) protos=("tcp" "udp") ;;
-                *)    protos=("tcp") ;;   # неизвестное значение в файле — безопасный дефолт
+                *)    protos=("tcp") ;;
             esac
 
             for P in "${protos[@]}"; do
@@ -299,7 +453,12 @@ apply_relay_rules() {
 
 # Полное принудительное применение: сначала база (идемпотентно), потом relay-правила.
 apply_all_rules() {
-    setup_base_firewall
+    local rc=0
+    setup_base_firewall || rc=$?
+    if (( rc == 2 )); then
+        echo -e "${C_RED}Изменения отменены — relay-правила не применялись.${C_RESET}"
+        return 1
+    fi
     apply_relay_rules
 }
 
@@ -331,6 +490,17 @@ render_table() {
     fi
     echo -e "${C_CYAN}└──────┴──────────────┴──────────────────────┴──────────────┴─────────┘${C_RESET}"
     echo -e "${C_DIM}SSH-порт сервера:${C_RESET} ${C_GREEN}$SSH_PORT${C_RESET}"
+
+    local cur_policy
+    cur_policy="$(get_policy iptables INPUT)"
+    if [[ "$cur_policy" == "DROP" ]]; then
+        echo -e "${C_DIM}Firewall:${C_RESET} ${C_GREEN}жёсткая блокировка активна (INPUT/FORWARD DROP)${C_RESET}"
+    else
+        echo -e "${C_DIM}Firewall:${C_RESET} ${C_YELLOW}жёсткая блокировка НЕ активна (INPUT ${cur_policy:-ACCEPT})${C_RESET}"
+    fi
+    if [[ -s "$EXTRA_PORTS_FILE" ]]; then
+        echo -e "${C_DIM}Доп. разрешённые порты сторонних служб:${C_RESET} $(tr '\n' ' ' < "$EXTRA_PORTS_FILE")"
+    fi
 }
 
 add_relay() {
@@ -356,6 +526,28 @@ add_relay() {
         fi
         break
     done
+
+    # Проверка: не занят ли этот порт локальной службой. DNAT перехватывает
+    # трафик в PREROUTING ДО того, как он попадёт в локальный сокет — если
+    # тут что-то уже слушает, relay его фактически "отрежет" от внешнего мира.
+    local listener=""
+    listener=$(ss -Htlnp 2>/dev/null | awk -v p=":${IN_PORT}\$" '$4 ~ p {print; exit}') || true
+    if [[ -z "$listener" ]]; then
+        listener=$(ss -Hulnp 2>/dev/null | awk -v p=":${IN_PORT}\$" '$4 ~ p {print; exit}') || true
+    fi
+    if [[ -n "$listener" ]]; then
+        echo ""
+        echo -e "${C_RED}⚠ ВНИМАНИЕ: на порту $IN_PORT уже слушает локальный процесс:${C_RESET}"
+        echo -e "  ${C_YELLOW}${listener}${C_RESET}"
+        echo -e "${C_RED}DNAT-правило перехватит трафик ДО того, как он дойдёт до этого процесса —${C_RESET}"
+        echo -e "${C_RED}служба на этом порту, скорее всего, перестанет быть доступна снаружи.${C_RESET}"
+        read -rp "$(echo -e "${C_BOLD}Всё равно продолжить и создать relay на порту $IN_PORT? (y/N): ${C_RESET}")" PORT_CONF
+        if [[ ! "$PORT_CONF" =~ ^[YyДд]$ ]]; then
+            echo "Отменено."
+            pause
+            return
+        fi
+    fi
 
     while true; do
         read -rp "$(echo -e "${C_BOLD}IP-адрес backend-ноды (куда слать): ${C_RESET}")" TARGET_IP
@@ -578,20 +770,137 @@ change_ssh_port() {
             return
         fi
         SSH_PORT="$NEW_SSH"
-        echo "SSH_PORT=$SSH_PORT" > "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-        # Добавляем ACCEPT для нового порта ДО любых изменений политики —
-        # setup_base_firewall сам ничего не удаляет, только дополняет.
-        apply_all_rules
+        set_env_var SSH_PORT "$SSH_PORT"
+        apply_all_rules || echo -e "${C_YELLOW}Изменения не были применены полностью.${C_RESET}"
     else
         echo -e "${C_RED}✖ Некорректный порт.${C_RESET}"
     fi
     pause
 }
 
+# ------------------------------------------------------------------------------
+# Полное удаление: откатывает ТОЛЬКО то, что добавил сам скрипт. Правила
+# сторонних систем (Docker/UFW/firewalld/Xray и т.п.) не трогаются.
+# ------------------------------------------------------------------------------
+uninstall_relay_manager() {
+    print_header
+    echo -e "${C_RED}${C_BOLD}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_RED}${C_BOLD}           ПОЛНОЕ УДАЛЕНИЕ RELAY-MANAGER                       ${C_RESET}"
+    echo -e "${C_RED}${C_BOLD}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    echo -e "Будут отменены ${C_BOLD}только${C_RESET} изменения, сделанные этим скриптом:"
+    echo -e "  • цепочки $CHAIN_NAT_PRE / $CHAIN_NAT_POST / $CHAIN_FWD и jump-правила на них;"
+    echo -e "  • правила INPUT/FORWARD для lo, established/related, SSH-порта и"
+    echo -e "    дополнительно разрешённых портов сторонних служб;"
+    echo -e "  • политики INPUT/FORWARD/OUTPUT вернутся к значениям, которые были"
+    echo -e "    ДО самого первого запуска скрипта на этом сервере;"
+    echo -e "  • файл /etc/sysctl.d/99-relay.conf."
+    echo ""
+    echo -e "${C_DIM}Конфигурация, swap-файл и сам скрипт удаляются только по отдельному${C_RESET}"
+    echo -e "${C_DIM}подтверждению ниже. Правила Docker/UFW/firewalld/Xray и т.п. не трогаются.${C_RESET}"
+    echo ""
+    read -rp "$(echo -e "${C_RED}${C_BOLD}Для подтверждения введи заглавными буквами УДАЛИТЬ: ${C_RESET}")" CONF_TEXT
+    if [[ "$CONF_TEXT" != "УДАЛИТЬ" ]]; then
+        echo "Отменено."
+        pause
+        return
+    fi
+
+    echo ""
+    echo -e "${C_YELLOW}⚙ Удаляю jump-правила...${C_RESET}"
+    while iptables -t nat -D PREROUTING -j "$CHAIN_NAT_PRE" 2>/dev/null; do :; done
+    while iptables -t nat -D POSTROUTING -j "$CHAIN_NAT_POST" 2>/dev/null; do :; done
+    while iptables -D FORWARD -j "$CHAIN_FWD" 2>/dev/null; do :; done
+
+    echo -e "${C_YELLOW}⚙ Удаляю цепочки relay-manager...${C_RESET}"
+    iptables -t nat -F "$CHAIN_NAT_PRE" 2>/dev/null || true
+    iptables -t nat -X "$CHAIN_NAT_PRE" 2>/dev/null || true
+    iptables -t nat -F "$CHAIN_NAT_POST" 2>/dev/null || true
+    iptables -t nat -X "$CHAIN_NAT_POST" 2>/dev/null || true
+    iptables -F "$CHAIN_FWD" 2>/dev/null || true
+    iptables -X "$CHAIN_FWD" 2>/dev/null || true
+
+    echo -e "${C_YELLOW}⚙ Удаляю базовые INPUT/FORWARD правила...${C_RESET}"
+    while iptables -D INPUT -i lo -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
+
+    while ip6tables -D INPUT -i lo -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p ipv6-icmp -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT 2>/dev/null; do :; done
+
+    if [[ -f "$EXTRA_PORTS_FILE" ]]; then
+        echo -e "${C_YELLOW}⚙ Удаляю правила для дополнительно разрешённых портов...${C_RESET}"
+        while IFS=: read -r xport xproto; do
+            [[ -z "$xport" ]] && continue
+            while iptables  -D INPUT -p "$xproto" --dport "$xport" -j ACCEPT 2>/dev/null; do :; done
+            while ip6tables -D INPUT -p "$xproto" --dport "$xport" -j ACCEPT 2>/dev/null; do :; done
+        done < "$EXTRA_PORTS_FILE"
+    fi
+
+    echo -e "${C_YELLOW}⚙ Восстанавливаю исходные политики цепочек...${C_RESET}"
+    # shellcheck source=/dev/null
+    [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+    iptables  -P INPUT   "${ORIG_INPUT_POLICY:-ACCEPT}"
+    iptables  -P FORWARD "${ORIG_FORWARD_POLICY:-ACCEPT}"
+    iptables  -P OUTPUT  "${ORIG_OUTPUT_POLICY:-ACCEPT}"
+    ip6tables -P INPUT   "${ORIG6_INPUT_POLICY:-ACCEPT}"
+    ip6tables -P FORWARD "${ORIG6_FORWARD_POLICY:-ACCEPT}"
+    ip6tables -P OUTPUT  "${ORIG6_OUTPUT_POLICY:-ACCEPT}"
+
+    netfilter-persistent save > /dev/null 2>&1 || true
+
+    if [[ -f /etc/sysctl.d/99-relay.conf ]]; then
+        rm -f /etc/sysctl.d/99-relay.conf
+        sysctl --system > /dev/null 2>&1 || true
+        echo -e "${C_GREEN}✔ sysctl-параметры relay-manager удалены.${C_RESET}"
+    fi
+
+    echo ""
+    echo -e "${C_GREEN}✔ Правила firewall и sysctl откачены к исходному состоянию.${C_RESET}"
+    echo ""
+
+    read -rp "$(echo -e "${C_BOLD}Удалить swap-файл $SWAP_FILE (если он был создан через этот скрипт)? (y/N): ${C_RESET}")" SWAP_ANS
+    if [[ "$SWAP_ANS" =~ ^[YyДд]$ ]]; then
+        swapoff "$SWAP_FILE" 2>/dev/null || true
+        sed -i "\|^${SWAP_FILE}[[:space:]]|d" /etc/fstab 2>/dev/null || true
+        rm -f "$SWAP_FILE"
+        echo -e "${C_GREEN}✔ Swap-файл удалён.${C_RESET}"
+    fi
+
+    read -rp "$(echo -e "${C_BOLD}Удалить конфигурацию и резервные копии ($CONF_DIR, $BACKUP_DIR)? (y/N): ${C_RESET}")" CONF_ANS
+    if [[ "$CONF_ANS" =~ ^[YyДд]$ ]]; then
+        rm -rf "$CONF_DIR" "$BACKUP_DIR"
+        echo -e "${C_GREEN}✔ Конфигурация и бэкапы удалены.${C_RESET}"
+    fi
+
+    read -rp "$(echo -e "${C_BOLD}Удалить сам файл скрипта? (y/N): ${C_RESET}")" SELF_ANS
+    if [[ "$SELF_ANS" =~ ^[YyДд]$ ]]; then
+        local self_path
+        self_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+        echo -e "${C_GREEN}✔ Удаляю $self_path и выхожу.${C_RESET}"
+        rm -f -- "$self_path"
+        exit 0
+    fi
+
+    echo ""
+    echo -e "${C_GREEN}${C_BOLD}Готово. Relay-manager деинсталлирован.${C_RESET}"
+    pause
+}
+
+save_pristine_state
 init_system
 load_or_ask_ssh_port
-setup_base_firewall
+
+if ! setup_base_firewall; then
+    rc=$?
+    if (( rc == 2 )); then
+        echo -e "${C_RED}Настройка отменена. Запусти скрипт снова, когда будешь готов.${C_RESET}"
+        exit 1
+    fi
+fi
 
 if [[ ! -s "$RELAYS_FILE" ]]; then
     add_relay
@@ -610,9 +919,10 @@ while true; do
     echo -e " ${C_YELLOW}4)${C_RESET} Изменить SSH-порт"
     echo -e " ${C_BLUE}5)${C_RESET} Принудительно переприменить правила"
     echo -e " ${C_CYAN}6)${C_RESET} Управление swap-файлом"
+    echo -e " ${C_RED}7)${C_RESET} Полностью удалить relay-manager"
     echo -e " ${C_DIM}0)${C_RESET} Выход"
     echo ""
-    read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-6]: ${C_RESET}")" CHOICE
+    read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-7]: ${C_RESET}")" CHOICE
 
     case "$CHOICE" in
         1) add_relay ;;
@@ -621,10 +931,11 @@ while true; do
         4) change_ssh_port ;;
         5)
             print_header
-            apply_all_rules
+            apply_all_rules || echo -e "${C_YELLOW}Изменения не были применены полностью.${C_RESET}"
             pause
             ;;
         6) manage_swap ;;
+        7) uninstall_relay_manager ;;
         0)
             clear
             echo -e "${C_GREEN}Сессия завершена.${C_RESET}"
@@ -635,5 +946,4 @@ while true; do
             sleep 1
             ;;
     esac
-done
 done
