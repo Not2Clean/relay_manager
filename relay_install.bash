@@ -210,7 +210,9 @@ list_foreign_listeners() {
       ss -Hulnp 2>/dev/null | awk '{print "UDP", $4, $6}'
     } | while read -r proto laddr proc; do
         local port="${laddr##*:}"
-        [[ "$laddr" == 127.0.0.1:* || "$laddr" == "[::1]:"* ]] && continue
+        # Весь диапазон 127.0.0.0/8 — loopback (например, systemd-resolved
+        # слушает DNS-stub на 127.0.0.53, а не только на 127.0.0.1).
+        [[ "$laddr" == 127.*:* || "$laddr" == "[::1]:"* ]] && continue
         [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]] && continue
         [[ "$port" == "${SSH_PORT:-}" ]] && continue
         if echo "$relay_ports" | grep -qx "$port"; then continue; fi
