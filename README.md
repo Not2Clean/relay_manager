@@ -32,12 +32,12 @@ sudo chmod 755 /usr/local/sbin/relay-manager && \
 sudo relay-manager
 ```
 
-Если нет доступа к `sudo`, установите в домашнюю директорию:
+Без `sudo`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Not2Clean/relay_manager/main/relay_install.bash \
-  -o ~/.local/bin/relay-manager && \
-chmod 755 ~/.local/bin/relay-manager && \
-~/.local/bin/relay-manager
+  -o /usr/local/sbin/relay-manager && \
+chmod 755 /usr/local/sbin/relay-manager && \
+relay-manager
 ```
-​```
+
