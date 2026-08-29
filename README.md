@@ -21,12 +21,22 @@ Bash-скрипт для настройки TCP/UDP-пробросов чере�
 
 > ⚠️ Скрипт изменяет настройки firewall. Перед запуском проверьте текущий SSH-порт и убедитесь, что у вас есть доступ к консоли сервера.
 
-## Установка
+## Установка Relay Manager
 
-Выполните одну команду:
+### С правами sudo (системная установка)
 
-```bash
+​```bash
 sudo curl -fsSL https://raw.githubusercontent.com/Not2Clean/relay_manager/main/relay_install.bash \
   -o /usr/local/sbin/relay-manager && \
 sudo chmod 755 /usr/local/sbin/relay-manager && \
 sudo relay-manager
+​```
+
+### Без sudo (только для текущего пользователя)
+
+​```bash
+curl -fsSL https://raw.githubusercontent.com/Not2Clean/relay_manager/main/relay_install.bash \
+  -o ~/.local/bin/relay-manager && \
+chmod 755 ~/.local/bin/relay-manager && \
+~/.local/bin/relay-manager
+​```
