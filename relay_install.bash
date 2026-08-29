@@ -801,9 +801,15 @@ uninstall_relay_manager() {
     echo -e "${C_DIM}Конфигурация, swap-файл и сам скрипт удаляются только по отдельному${C_RESET}"
     echo -e "${C_DIM}подтверждению ниже. Правила Docker/UFW/firewalld/Xray и т.п. не трогаются.${C_RESET}"
     echo ""
-    read -rp "$(echo -e "${C_RED}${C_BOLD}Для подтверждения введи заглавными буквами УДАЛИТЬ: ${C_RESET}")" CONF_TEXT
-    if [[ "$CONF_TEXT" != "УДАЛИТЬ" ]]; then
-        echo "Отменено."
+
+    # Подтверждение случайным числовым кодом — надёжнее фиксированного слова:
+    # код каждый раз новый, поэтому его нельзя ввести "на автомате" или случайно
+    # вставить из буфера обмена.
+    local CONF_CODE CONF_INPUT
+    CONF_CODE=$(( RANDOM % 9000 + 1000 ))
+    read -rp "$(echo -e "${C_RED}${C_BOLD}Для подтверждения введи код ${CONF_CODE}: ${C_RESET}")" CONF_INPUT
+    if [[ "$CONF_INPUT" != "$CONF_CODE" ]]; then
+        echo "Код не совпадает. Отменено."
         pause
         return
     fi
