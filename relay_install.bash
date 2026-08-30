@@ -198,6 +198,58 @@ load_or_ask_ssh_port() {
 }
 
 # ------------------------------------------------------------------------------
+# Публичный IP сервера — нужен для SNAT (вместо MASQUERADE). На VPS со
+# статическим IP это эффективнее: MASQUERADE каждый раз заново вычисляет
+# исходящий адрес интерфейса, SNAT — фиксированный adres, известный заранее.
+# Если сервер потом получит другой IP (миграция, смена провайдера), а
+# сохранённое значение не обновить — SNAT будет молча подставлять неверный
+# адрес и релеи перестанут работать. Поэтому при каждом запуске сверяем
+# сохранённое значение с тем, что реально определяется по таблице маршрутизации.
+# ------------------------------------------------------------------------------
+detect_public_ip() {
+    ip -4 route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )\S+' | head -n1 || true
+}
+
+load_or_ask_public_ip() {
+    if [[ -n "${PUBLIC_IP:-}" ]] && ! valid_ipv4 "$PUBLIC_IP"; then
+        unset PUBLIC_IP
+    fi
+
+    local current_ip
+    current_ip="$(detect_public_ip)"
+
+    if [[ -z "${PUBLIC_IP:-}" ]]; then
+        print_header
+        echo -e "${C_YELLOW}Настройка исходящего адреса для SNAT (проброс трафика к backend):${C_RESET}"
+        echo -e "${C_DIM}Нужен статический публичный IP этого сервера — не адрес backend-ноды.${C_RESET}"
+        while true; do
+            read -rp "$(echo -e "${C_BOLD}Публичный IP этого сервера [${C_GREEN}${current_ip:-неизвестно}${C_RESET}${C_BOLD}]: ${C_RESET}")" INPUT_IP
+            INPUT_IP="${INPUT_IP:-$current_ip}"
+            if [[ -n "$INPUT_IP" ]] && valid_ipv4 "$INPUT_IP"; then
+                PUBLIC_IP="$INPUT_IP"
+                set_env_var PUBLIC_IP "$PUBLIC_IP"
+                break
+            fi
+            echo -e "${C_RED}✖ Некорректный IPv4-адрес.${C_RESET}"
+        done
+    elif [[ -n "$current_ip" && "$current_ip" != "$PUBLIC_IP" ]]; then
+        echo -e "${C_RED}⚠ ВНИМАНИЕ: сохранённый публичный IP ($PUBLIC_IP) отличается от${C_RESET}"
+        echo -e "${C_RED}  реально определённого сейчас по маршрутизации ($current_ip).${C_RESET}"
+        echo -e "${C_RED}  Если IP сервера правда сменился — SNAT будет подставлять неверный${C_RESET}"
+        echo -e "${C_RED}  адрес, и relay-пробросы перестанут отвечать клиентам.${C_RESET}"
+        read -rp "$(echo -e "${C_BOLD}Обновить публичный IP на ${current_ip}? (y/N): ${C_RESET}")" IP_UPD
+        if [[ "$IP_UPD" =~ ^[YyДд]$ ]]; then
+            PUBLIC_IP="$current_ip"
+            set_env_var PUBLIC_IP "$PUBLIC_IP"
+            echo -e "${C_GREEN}✔ Публичный IP обновлён.${C_RESET}"
+        else
+            echo -e "${C_DIM}Оставляю как есть: $PUBLIC_IP. Проверь вручную, если релеи не отвечают.${C_RESET}"
+        fi
+        sleep 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # Ищет порты, на которых слушают ЧУЖИЕ службы (не SSH и не relay-входы).
 # Печатает строки "PROTO PORT PROCESS". Это эвристика поверх `ss`, не идеальная,
 # но покрывает основной случай — прямые сервисы вроде Xray/nginx на хосте.
@@ -424,9 +476,12 @@ apply_relay_rules() {
     iptables -F "$CHAIN_FWD"
 
     if [[ -s "$RELAYS_FILE" ]]; then
-        while IFS=':' read -r LPORT BIP BPORT PROTO; do
+        while IFS=':' read -r LPORT BIP BPORT PROTO CONNLIMIT; do
             [[ -z "$LPORT" || "$LPORT" =~ ^# ]] && continue
             PROTO="${PROTO:-tcp}"
+            # Старые строки без 5-го поля — лимит соединений не задан (отключён).
+            CONNLIMIT="${CONNLIMIT:-0}"
+            [[ "$CONNLIMIT" =~ ^[0-9]+$ ]] || CONNLIMIT=0
 
             local protos=()
             case "$PROTO" in
@@ -438,7 +493,32 @@ apply_relay_rules() {
 
             for P in "${protos[@]}"; do
                 iptables -t nat -A "$CHAIN_NAT_PRE" -p "$P" --dport "$LPORT" -j DNAT --to-destination "$BIP:$BPORT"
-                iptables -t nat -A "$CHAIN_NAT_POST" -p "$P" -d "$BIP" --dport "$BPORT" -j MASQUERADE
+
+                # SNAT вместо MASQUERADE: у нас статический публичный IP, поэтому
+                # адрес известен заранее и не нужно вычислять его на каждый пакет
+                # (как это делает MASQUERADE). Если публичный IP почему-то не задан —
+                # безопасный запасной вариант — MASQUERADE, чтобы relay не встал колом.
+                if [[ -n "${PUBLIC_IP:-}" ]]; then
+                    iptables -t nat -A "$CHAIN_NAT_POST" -p "$P" -d "$BIP" --dport "$BPORT" \
+                        -j SNAT --to-source "$PUBLIC_IP"
+                else
+                    iptables -t nat -A "$CHAIN_NAT_POST" -p "$P" -d "$BIP" --dport "$BPORT" -j MASQUERADE
+                fi
+
+                # Лимит одновременных соединений с одного source IP — защита backend
+                # от перегрузки одним клиентом. Ставь с большим запасом: за одним
+                # публичным IP может стоять NAT/CGNAT с множеством реальных клиентов
+                # (особенно если backend — VPN/прокси, как у Xray).
+                if (( CONNLIMIT > 0 )); then
+                    if [[ "$P" == "tcp" ]]; then
+                        iptables -A "$CHAIN_FWD" -p tcp --syn -d "$BIP" --dport "$BPORT" \
+                            -m connlimit --connlimit-above "$CONNLIMIT" --connlimit-mask 32 -j DROP
+                    else
+                        iptables -A "$CHAIN_FWD" -p udp -d "$BIP" --dport "$BPORT" \
+                            -m conntrack --ctstate NEW \
+                            -m connlimit --connlimit-above "$CONNLIMIT" --connlimit-mask 32 -j DROP
+                    fi
+                fi
 
                 iptables -A "$CHAIN_FWD" -p "$P" -d "$BIP" --dport "$BPORT" -m conntrack --ctstate NEW \
                     -m hashlimit --hashlimit-above 100/sec --hashlimit-burst 200 \
@@ -473,25 +553,48 @@ proto_label() {
     esac
 }
 
+# Переводит байты в человекочитаемый вид (KB/MB/GB/TB), 2 знака после запятой.
+human_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN{
+        split("B KB MB GB TB PB", units, " ");
+        i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        printf "%.2f %s", b, units[i]
+    }'
+}
+
+# Суммирует пакеты/байты для конкретного порта+протокола из цепочки DNAT.
+# Печатает "PKTS BYTES" (0 0, если правило не найдено).
+get_relay_counters() {
+    local lport="$1" proto="$2"
+    iptables -t nat -L "$CHAIN_NAT_PRE" -n -v -x 2>/dev/null | \
+        awk -v port="$lport" -v proto="$proto" \
+            '$4 == proto && $0 ~ ("dpt:" port "( |$)") {pkts += $1; bytes += $2}
+             END {print pkts+0, bytes+0}'
+}
+
 render_table() {
-    echo -e "${C_CYAN}┌──────┬──────────────┬──────────────────────┬──────────────┬─────────┐${C_RESET}"
-    echo -e "${C_CYAN}│${C_BOLD}  №   │  ВХОД (ПОРТ) │      BACKEND IP      │ БЭКЕНД ПОРТ  │ ПРОТОКОЛ${C_RESET}${C_CYAN}│${C_RESET}"
-    echo -e "${C_CYAN}├──────┼──────────────┼──────────────────────┼──────────────┼─────────┤${C_RESET}"
+    echo -e "${C_CYAN}┌──────┬──────────────┬──────────────────────┬──────────────┬─────────┬────────────┐${C_RESET}"
+    echo -e "${C_CYAN}│${C_BOLD}  №   │  ВХОД (ПОРТ) │      BACKEND IP      │ БЭКЕНД ПОРТ  │ ПРОТОКОЛ│ CONN-ЛИМИТ ${C_RESET}${C_CYAN}│${C_RESET}"
+    echo -e "${C_CYAN}├──────┼──────────────┼──────────────────────┼──────────────┼─────────┼────────────┤${C_RESET}"
 
     local i=1
     if [[ ! -s "$RELAYS_FILE" ]]; then
         echo -e "${C_CYAN}│${C_RESET}          ${C_DIM}Нет настроенных релей-пробросов${C_RESET}                       ${C_CYAN}│${C_RESET}"
     else
-        while IFS=':' read -r LPORT BIP BPORT PROTO; do
+        while IFS=':' read -r LPORT BIP BPORT PROTO CONNLIMIT; do
             [[ -z "$LPORT" || "$LPORT" =~ ^# ]] && continue
             PROTO="${PROTO:-tcp}"
-            printf "${C_CYAN}│${C_RESET} %-4s ${C_CYAN}│${C_RESET} %-12s ${C_CYAN}│${C_RESET} %-20s ${C_CYAN}│${C_RESET} %-12s ${C_CYAN}│${C_RESET} %-7s ${C_CYAN}│${C_RESET}\n" \
-                "$i" "$LPORT" "$BIP" "$BPORT" "$(proto_label "$PROTO")"
+            local limit_label="—"
+            [[ "$CONNLIMIT" =~ ^[0-9]+$ ]] && (( CONNLIMIT > 0 )) && limit_label="$CONNLIMIT"
+            printf "${C_CYAN}│${C_RESET} %-4s ${C_CYAN}│${C_RESET} %-12s ${C_CYAN}│${C_RESET} %-20s ${C_CYAN}│${C_RESET} %-12s ${C_CYAN}│${C_RESET} %-7s ${C_CYAN}│${C_RESET} %-10s ${C_CYAN}│${C_RESET}\n" \
+                "$i" "$LPORT" "$BIP" "$BPORT" "$(proto_label "$PROTO")" "$limit_label"
             ((i++))
         done < "$RELAYS_FILE"
     fi
-    echo -e "${C_CYAN}└──────┴──────────────┴──────────────────────┴──────────────┴─────────┘${C_RESET}"
-    echo -e "${C_DIM}SSH-порт сервера:${C_RESET} ${C_GREEN}$SSH_PORT${C_RESET}"
+    echo -e "${C_CYAN}└──────┴──────────────┴──────────────────────┴──────────────┴─────────┴────────────┘${C_RESET}"
+    echo -e "${C_DIM}SSH-порт сервера:${C_RESET} ${C_GREEN}$SSH_PORT${C_RESET}    ${C_DIM}Публичный IP (SNAT):${C_RESET} ${C_GREEN}${PUBLIC_IP:-MASQUERADE (не задан)}${C_RESET}"
 
     local cur_policy
     cur_policy="$(get_policy iptables INPUT)"
@@ -581,7 +684,20 @@ add_relay() {
     esac
 
     echo ""
-    echo "${IN_PORT}:${TARGET_IP}:${TARGET_PORT}:${PROTO}" >> "$RELAYS_FILE"
+    echo -e "${C_BOLD}Лимит одновременных соединений с одного IP на этот relay:${C_RESET}"
+    echo -e "${C_DIM}Защищает backend от перегрузки одним клиентом. Если backend — VPN/прокси,${C_RESET}"
+    echo -e "${C_DIM}за одним публичным IP может стоять NAT с множеством реальных пользователей —${C_RESET}"
+    echo -e "${C_DIM}ставь с большим запасом, чтобы не резать легитимный трафик. 0 — без лимита.${C_RESET}"
+    local CONNLIMIT
+    while true; do
+        read -rp "$(echo -e "${C_BOLD}Лимит [${C_GREEN}500${C_RESET}${C_BOLD}, 0 = выключить]: ${C_RESET}")" CONNLIMIT
+        CONNLIMIT="${CONNLIMIT:-500}"
+        [[ "$CONNLIMIT" =~ ^[0-9]+$ ]] && break
+        echo -e "${C_RED}✖ Введи целое число.${C_RESET}"
+    done
+
+    echo ""
+    echo "${IN_PORT}:${TARGET_IP}:${TARGET_PORT}:${PROTO}:${CONNLIMIT}" >> "$RELAYS_FILE"
     apply_relay_rules
 
     if [[ "$PROTO" == "tcp" || "$PROTO" == "both" ]]; then
@@ -642,12 +758,286 @@ show_stats() {
     print_header
     echo -e "${C_BOLD}${C_YELLOW}➜ Мониторинг трафика и статус${C_RESET}"
     echo ""
-    render_table
+
+    if [[ ! -s "$RELAYS_FILE" ]]; then
+        echo -e "${C_DIM}Нет настроенных релей-пробросов.${C_RESET}"
+        pause
+        return
+    fi
+
+    echo -e "${C_CYAN}┌──────┬──────────────┬──────────────────────┬──────────────┬─────────┬────────────┬──────────────┐${C_RESET}"
+    echo -e "${C_CYAN}│${C_BOLD}  №   │  ВХОД (ПОРТ) │      BACKEND IP      │ БЭКЕНД ПОРТ  │ ПРОТОКОЛ│   ПАКЕТЫ   │    ТРАФИК    ${C_RESET}${C_CYAN}│${C_RESET}"
+    echo -e "${C_CYAN}├──────┼──────────────┼──────────────────────┼──────────────┼─────────┼────────────┼──────────────┤${C_RESET}"
+
+    local i=1 total_pkts=0 total_bytes=0
+    while IFS=':' read -r LPORT BIP BPORT PROTO CONNLIMIT; do
+        [[ -z "$LPORT" || "$LPORT" =~ ^# ]] && continue
+        PROTO="${PROTO:-tcp}"
+
+        local protos=()
+        case "$PROTO" in
+            tcp)  protos=("tcp") ;;
+            udp)  protos=("udp") ;;
+            both) protos=("tcp" "udp") ;;
+            *)    protos=("tcp") ;;
+        esac
+
+        local pkts=0 bytes=0 p_pkts p_bytes
+        for P in "${protos[@]}"; do
+            read -r p_pkts p_bytes <<< "$(get_relay_counters "$LPORT" "$P")"
+            pkts=$(( pkts + p_pkts ))
+            bytes=$(( bytes + p_bytes ))
+        done
+        total_pkts=$(( total_pkts + pkts ))
+        total_bytes=$(( total_bytes + bytes ))
+
+        printf "${C_CYAN}│${C_RESET} %-4s ${C_CYAN}│${C_RESET} %-12s ${C_CYAN}│${C_RESET} %-20s ${C_CYAN}│${C_RESET} %-12s ${C_CYAN}│${C_RESET} %-7s ${C_CYAN}│${C_RESET} %10s ${C_CYAN}│${C_RESET} %12s ${C_CYAN}│${C_RESET}\n" \
+            "$i" "$LPORT" "$BIP" "$BPORT" "$(proto_label "$PROTO")" "$pkts" "$(human_bytes "$bytes")"
+        ((i++))
+    done < "$RELAYS_FILE"
+
+    echo -e "${C_CYAN}└──────┴──────────────┴──────────────────────┴──────────────┴─────────┴────────────┴──────────────┘${C_RESET}"
     echo ""
-    echo -e "${C_BOLD}Счётчики пакетов ядра (iptables NAT, цепочка $CHAIN_NAT_PRE):${C_RESET}"
-    echo -e "${C_DIM}──────────────────────────────────────────────────────────────${C_RESET}"
-    iptables -t nat -L "$CHAIN_NAT_PRE" -n -v --line-numbers 2>/dev/null || echo -e "${C_DIM}Цепочка ещё не создана — примени правила (пункт 5).${C_RESET}"
+    echo -e "${C_BOLD}Итого:${C_RESET} ${C_GREEN}$total_pkts${C_RESET} пакетов, ${C_GREEN}$(human_bytes "$total_bytes")${C_RESET}"
+    echo -e "${C_DIM}Счётчики обнуляются при перезагрузке сервера или ручном сбросе iptables.${C_RESET}"
     pause
+}
+
+# ------------------------------------------------------------------------------
+# Установка XanMod-ядра (performance-ядро с BBRv3 и оптимизированным
+# планировщиком). Ставится ТОЛЬКО пакетом из официального репозитория —
+# без сторонних скриптов установки, чтобы не тянуть неизвестный код с правами root.
+# ------------------------------------------------------------------------------
+detect_x86_64_level() {
+    local flags
+    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
+    if echo "$flags" | grep -qw avx512f; then
+        echo "x64v4"
+    elif echo "$flags" | grep -qw avx2 && echo "$flags" | grep -qw bmi2; then
+        echo "x64v3"
+    elif echo "$flags" | grep -qw sse4_2 && echo "$flags" | grep -qw popcnt; then
+        echo "x64v2"
+    else
+        echo "x64v1"
+    fi
+}
+
+install_xanmod() {
+    print_header
+    echo -e "${C_BOLD}${C_YELLOW}➜ Установка XanMod-ядра (BBRv3, performance)${C_RESET}"
+    echo ""
+
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+        echo -e "${C_RED}✖ XanMod собирается только под x86_64 (amd64). Эта архитектура: $(uname -m).${C_RESET}"
+        pause
+        return
+    fi
+
+    local virt="unknown"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        virt=$(systemd-detect-virt 2>/dev/null || echo "none")
+    fi
+    case "$virt" in
+        openvz|lxc|lxc-libvirt|docker)
+            echo -e "${C_RED}✖ Обнаружена виртуализация на уровне контейнера ($virt).${C_RESET}"
+            echo -e "${C_RED}  В таких средах ядро общее с хостом — установить своё ядро нельзя.${C_RESET}"
+            pause
+            return
+            ;;
+        none)
+            echo -e "${C_DIM}Виртуализация не обнаружена (bare metal) — ограничений нет.${C_RESET}"
+            ;;
+        *)
+            echo -e "${C_DIM}Тип виртуализации: $virt (обычно совместимо: KVM/Xen/VMware/Hyper-V).${C_RESET}"
+            ;;
+    esac
+
+    if dpkg -l 2>/dev/null | grep -q '^ii  linux-image-.*xanmod'; then
+        echo -e "${C_YELLOW}⚠ Похоже, XanMod-ядро уже установлено:${C_RESET}"
+        dpkg -l 2>/dev/null | awk '/^ii  linux-image-.*xanmod/{print "  "$2, $3}'
+        echo -e "${C_DIM}Повторная установка обновит его до последней версии в этой же ветке.${C_RESET}"
+        echo ""
+    fi
+
+    local level
+    level=$(detect_x86_64_level)
+    echo -e "Определённый уровень CPU (x86-64 psABI): ${C_GREEN}${level}${C_RESET}"
+    echo -e "${C_DIM}v1 — совместимо всегда; v2/v3/v4 — новее CPU, быстрее, но менее совместимо.${C_RESET}"
+    read -rp "$(echo -e "${C_BOLD}Использовать этот уровень? [Y/n], либо введи свой (v1-v4): ${C_RESET}")" LEVEL_ANS
+    case "${LEVEL_ANS,,}" in
+        ""|y|yes|д|да) : ;;
+        v1) level="x64v1" ;;
+        v2) level="x64v2" ;;
+        v3) level="x64v3" ;;
+        v4) level="x64v4" ;;
+        *) echo -e "${C_YELLOW}Не распознано, использую определённый автоматически: $level${C_RESET}" ;;
+    esac
+
+    echo ""
+    echo -e "${C_RED}⚠ ВНИМАНИЕ:${C_RESET}"
+    echo -e "${C_RED}  • Потребуется ПЕРЕЗАГРУЗКА сервера, чтобы ядро вступило в силу.${C_RESET}"
+    echo -e "${C_RED}  • Secure Boot должен быть выключен — ядро XanMod не подписано ключом Microsoft.${C_RESET}"
+    echo -e "${C_RED}  • Если на сервере есть модули NVIDIA/OpenZFS/VirtualBox/VMware (DKMS) —${C_RESET}"
+    echo -e "${C_RED}    проверь их совместимость с новым ядром ДО перезагрузки.${C_RESET}"
+    echo -e "${C_DIM}  Старое ядро остаётся в GRUB — при проблемах можно загрузиться в него вручную.${C_RESET}"
+    echo ""
+    read -rp "$(echo -e "${C_BOLD}Продолжить установку linux-xanmod-${level}? (y/N): ${C_RESET}")" XAN_CONF
+    if [[ ! "$XAN_CONF" =~ ^[YyДд]$ ]]; then
+        echo "Отменено."
+        pause
+        return
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    echo -e "${C_YELLOW}⚙ Добавляю официальный репозиторий XanMod...${C_RESET}"
+    mkdir -p /usr/share/keyrings
+    if ! wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg; then
+        echo -e "${C_RED}✖ Не удалось получить GPG-ключ репозитория. Проверь сеть и повтори позже.${C_RESET}" >&2
+        pause
+        return
+    fi
+    echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" \
+        > /etc/apt/sources.list.d/xanmod-release.list
+
+    if ! apt-get update -y > /dev/null 2>&1; then
+        echo -e "${C_RED}✖ Не удалось обновить списки пакетов после добавления репозитория XanMod.${C_RESET}" >&2
+        pause
+        return
+    fi
+
+    echo -e "${C_YELLOW}⚙ Устанавливаю linux-xanmod-${level} (это может занять пару минут)...${C_RESET}"
+    if ! apt-get install -y "linux-xanmod-${level}" > /tmp/xanmod-install.log 2>&1; then
+        echo -e "${C_RED}✖ Установка не удалась. Последние строки лога:${C_RESET}" >&2
+        tail -n 20 /tmp/xanmod-install.log >&2
+        pause
+        return
+    fi
+
+    echo -e "${C_GREEN}✔ Ядро linux-xanmod-${level} установлено.${C_RESET}"
+    echo -e "${C_DIM}Активируется после перезагрузки. Текущее ядро: $(uname -r)${C_RESET}"
+    echo ""
+    read -rp "$(echo -e "${C_BOLD}Перезагрузить сервер сейчас? (y/N): ${C_RESET}")" REBOOT_ANS
+    if [[ "$REBOOT_ANS" =~ ^[YyДд]$ ]]; then
+        echo -e "${C_YELLOW}Перезагрузка...${C_RESET}"
+        sleep 1
+        reboot
+    else
+        echo -e "${C_DIM}Не забудь перезагрузить сервер вручную (${C_BOLD}reboot${C_RESET}${C_DIM}), когда будет удобно.${C_RESET}"
+    fi
+    pause
+}
+
+# ------------------------------------------------------------------------------
+# Откат XanMod: удаляет установленные пакеты ядра, чистит GRUB и (по желанию)
+# репозиторий/ключ. Не трогает НИКАКИЕ другие ядра — только xanmod-пакеты.
+# ------------------------------------------------------------------------------
+uninstall_xanmod() {
+    print_header
+    echo -e "${C_BOLD}${C_YELLOW}➜ Откат XanMod-ядра${C_RESET}"
+    echo ""
+
+    mapfile -t XAN_PKGS < <(dpkg -l 2>/dev/null | \
+        awk '/^ii[[:space:]]+linux-(image|headers)-.*xanmod/{print $2} /^ii[[:space:]]+linux-xanmod-/{print $2}')
+
+    if (( ${#XAN_PKGS[@]} == 0 )); then
+        echo -e "${C_DIM}XanMod-пакеты не найдены — откатывать нечего.${C_RESET}"
+        pause
+        return
+    fi
+
+    echo -e "Найдены установленные пакеты XanMod:"
+    local p
+    for p in "${XAN_PKGS[@]}"; do
+        echo -e "  ${C_YELLOW}${p}${C_RESET}"
+    done
+    echo ""
+
+    local running_xanmod=0
+    if [[ "$(uname -r)" == *xanmod* ]]; then
+        running_xanmod=1
+        echo -e "${C_RED}⚠ Сейчас загружено именно XanMod-ядро ($(uname -r)).${C_RESET}"
+        echo -e "${C_RED}  Пакеты удалятся, но фактически вернуться на прежнее ядро можно${C_RESET}"
+        echo -e "${C_RED}  только ПОСЛЕ перезагрузки.${C_RESET}"
+        if ! dpkg -l 2>/dev/null | grep -qE '^ii[[:space:]]+linux-image-[0-9]'; then
+            echo -e "${C_RED}✖ В системе не найдено ни одного НЕ-XanMod ядра!${C_RESET}"
+            echo -e "${C_RED}  Удалять единственное установленное ядро нельзя — сервер не загрузится.${C_RESET}"
+            echo -e "${C_DIM}  Сначала поставь штатное ядро дистрибутива, затем повтори откат.${C_RESET}"
+            pause
+            return
+        fi
+        echo ""
+    fi
+
+    read -rp "$(echo -e "${C_BOLD}Удалить перечисленные пакеты XanMod? (y/N): ${C_RESET}")" XAN_DEL
+    if [[ ! "$XAN_DEL" =~ ^[YyДд]$ ]]; then
+        echo "Отменено."
+        pause
+        return
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    echo -e "${C_YELLOW}⚙ Удаляю пакеты...${C_RESET}"
+    if ! apt-get purge -y "${XAN_PKGS[@]}" > /tmp/xanmod-remove.log 2>&1; then
+        echo -e "${C_RED}✖ Не удалось удалить пакеты. Последние строки лога:${C_RESET}" >&2
+        tail -n 20 /tmp/xanmod-remove.log >&2
+        pause
+        return
+    fi
+    apt-get autoremove -y > /dev/null 2>&1 || true
+
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub > /dev/null 2>&1 || true
+    fi
+    echo -e "${C_GREEN}✔ Пакеты XanMod удалены, GRUB обновлён.${C_RESET}"
+
+    read -rp "$(echo -e "${C_BOLD}Удалить также репозиторий и ключ XanMod из APT? (y/N): ${C_RESET}")" XAN_REPO_DEL
+    if [[ "$XAN_REPO_DEL" =~ ^[YyДд]$ ]]; then
+        rm -f /etc/apt/sources.list.d/xanmod-release.list /usr/share/keyrings/xanmod-archive-keyring.gpg
+        apt-get update -y > /dev/null 2>&1 || true
+        echo -e "${C_GREEN}✔ Репозиторий и ключ удалены.${C_RESET}"
+    fi
+
+    if (( running_xanmod == 1 )); then
+        echo ""
+        read -rp "$(echo -e "${C_BOLD}Перезагрузить сейчас, чтобы вернуться на прежнее ядро? (y/N): ${C_RESET}")" XAN_REBOOT
+        if [[ "$XAN_REBOOT" =~ ^[YyДд]$ ]]; then
+            echo -e "${C_YELLOW}Перезагрузка...${C_RESET}"
+            sleep 1
+            reboot
+        else
+            echo -e "${C_DIM}Не забудь перезагрузиться (${C_BOLD}reboot${C_RESET}${C_DIM}), чтобы фактически вернуться на прежнее ядро.${C_RESET}"
+        fi
+    fi
+    pause
+}
+
+manage_xanmod() {
+    while true; do
+        print_header
+        echo -e "${C_BOLD}${C_YELLOW}➜ Управление XanMod-ядром${C_RESET}"
+        echo ""
+        if [[ "$(uname -r)" == *xanmod* ]]; then
+            echo -e "Сейчас загружено: ${C_GREEN}$(uname -r)${C_RESET} (XanMod активен)"
+        elif dpkg -l 2>/dev/null | grep -qE '^ii[[:space:]]+linux-(image|headers)-.*xanmod'; then
+            echo -e "Текущее ядро: ${C_DIM}$(uname -r)${C_RESET} (XanMod установлен, но ещё не загружен — нужна перезагрузка)"
+        else
+            echo -e "Текущее ядро: ${C_DIM}$(uname -r)${C_RESET} (XanMod не установлен)"
+        fi
+        echo ""
+        echo -e "${C_BOLD}Действия:${C_RESET}"
+        echo -e " ${C_GREEN}1)${C_RESET} Установить / обновить XanMod ядро"
+        echo -e " ${C_RED}2)${C_RESET} Откатить (удалить) XanMod ядро"
+        echo -e " ${C_DIM}0)${C_RESET} Назад в меню"
+        echo ""
+        read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-2]: ${C_RESET}")" XAN_CHOICE
+
+        case "$XAN_CHOICE" in
+            1) install_xanmod ;;
+            2) uninstall_xanmod ;;
+            0) return ;;
+            *) echo -e "${C_RED}Неверный пункт.${C_RESET}"; sleep 1 ;;
+        esac
+    done
 }
 
 manage_swap() {
@@ -780,6 +1170,56 @@ change_ssh_port() {
     pause
 }
 
+change_public_ip() {
+    print_header
+    echo -e "${C_BOLD}${C_YELLOW}➜ Изменить публичный IP (для SNAT)${C_RESET}"
+    echo ""
+    echo -e "${C_DIM}Текущее значение: ${C_GREEN}${PUBLIC_IP:-не задан, используется MASQUERADE}${C_RESET}"
+    echo -e "${C_DIM}Определено по маршрутизации сейчас: ${C_GREEN}$(detect_public_ip)${C_RESET}"
+    echo -e "${C_RED}⚠ Если указать неверный IP, релеи перестанут отвечать клиентам${C_RESET}"
+    echo -e "${C_RED}  (пакеты будут уходить с неправильным исходящим адресом).${C_RESET}"
+    echo ""
+    read -rp "$(echo -e "${C_BOLD}Новый публичный IP [оставь пустым, чтобы отменить]: ${C_RESET}")" NEW_IP
+    if [[ -z "$NEW_IP" ]]; then
+        echo "Отменено."
+        pause
+        return
+    fi
+    if valid_ipv4 "$NEW_IP"; then
+        PUBLIC_IP="$NEW_IP"
+        set_env_var PUBLIC_IP "$PUBLIC_IP"
+        apply_relay_rules
+        echo -e "${C_GREEN}✔ Публичный IP обновлён, relay-правила пересобраны.${C_RESET}"
+    else
+        echo -e "${C_RED}✖ Некорректный IPv4-адрес.${C_RESET}"
+    fi
+    pause
+}
+
+network_settings() {
+    while true; do
+        print_header
+        echo -e "${C_BOLD}${C_YELLOW}➜ Сетевые настройки${C_RESET}"
+        echo ""
+        echo -e "SSH-порт: ${C_GREEN}$SSH_PORT${C_RESET}"
+        echo -e "Публичный IP (SNAT): ${C_GREEN}${PUBLIC_IP:-не задан, MASQUERADE}${C_RESET}"
+        echo ""
+        echo -e "${C_BOLD}Действия:${C_RESET}"
+        echo -e " ${C_GREEN}1)${C_RESET} Изменить SSH-порт"
+        echo -e " ${C_CYAN}2)${C_RESET} Изменить публичный IP"
+        echo -e " ${C_DIM}0)${C_RESET} Назад в меню"
+        echo ""
+        read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-2]: ${C_RESET}")" NET_CHOICE
+        case "$NET_CHOICE" in
+            1) change_ssh_port ;;
+            2) change_public_ip ;;
+            0) return ;;
+            *) echo -e "${C_RED}Неверный пункт.${C_RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+
 # ------------------------------------------------------------------------------
 # Полное удаление: откатывает ТОЛЬКО то, что добавил сам скрипт. Правила
 # сторонних систем (Docker/UFW/firewalld/Xray и т.п.) не трогаются.
@@ -901,6 +1341,7 @@ uninstall_relay_manager() {
 save_pristine_state
 init_system
 load_or_ask_ssh_port
+load_or_ask_public_ip
 
 if ! setup_base_firewall; then
     rc=$?
@@ -924,26 +1365,28 @@ while true; do
     echo -e " ${C_GREEN}1)${C_RESET} Добавить новый релей (TCP/UDP)"
     echo -e " ${C_RED}2)${C_RESET} Удалить релей"
     echo -e " ${C_CYAN}3)${C_RESET} Показать статистику трафика (iptables counters)"
-    echo -e " ${C_YELLOW}4)${C_RESET} Изменить SSH-порт"
+    echo -e " ${C_YELLOW}4)${C_RESET} Сетевые настройки (SSH-порт / публичный IP)"
     echo -e " ${C_BLUE}5)${C_RESET} Принудительно переприменить правила"
     echo -e " ${C_CYAN}6)${C_RESET} Управление swap-файлом"
-    echo -e " ${C_RED}7)${C_RESET} Полностью удалить relay-manager"
+    echo -e " ${C_BLUE}7)${C_RESET} Управление XanMod ядром (установка/откат)"
+    echo -e " ${C_RED}8)${C_RESET} Полностью удалить relay-manager"
     echo -e " ${C_DIM}0)${C_RESET} Выход"
     echo ""
-    read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-7]: ${C_RESET}")" CHOICE
+    read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-8]: ${C_RESET}")" CHOICE
 
     case "$CHOICE" in
         1) add_relay ;;
         2) delete_relay ;;
         3) show_stats ;;
-        4) change_ssh_port ;;
+        4) network_settings ;;
         5)
             print_header
             apply_all_rules || echo -e "${C_YELLOW}Изменения не были применены полностью.${C_RESET}"
             pause
             ;;
         6) manage_swap ;;
-        7) uninstall_relay_manager ;;
+        7) manage_xanmod ;;
+        8) uninstall_relay_manager ;;
         0)
             clear
             echo -e "${C_GREEN}Сессия завершена.${C_RESET}"
