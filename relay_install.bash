@@ -1196,6 +1196,157 @@ change_public_ip() {
     pause
 }
 
+# ------------------------------------------------------------------------------
+# Отключение входа по паролю (SSH только по ключу). Самая рискованная операция
+# в скрипте — ошибка здесь может НАВСЕГДА отрезать доступ к серверу, если нет
+# консоли у хостера. Поэтому три обязательных страховки:
+#   1) проверка, что ключ вообще есть, ДО отключения пароля;
+#   2) sshd -t перед перезапуском службы — невалидный конфиг не применяется;
+#   3) фоновый watchdog: если в течение 90 секунд не подтвердить, что новая
+#      сессия по ключу реально открылась, конфиг откатывается автоматически.
+# ------------------------------------------------------------------------------
+harden_ssh_key_only() {
+    print_header
+    echo -e "${C_BOLD}${C_YELLOW}➜ Отключение входа по паролю (SSH — только по ключу)${C_RESET}"
+    echo ""
+    echo -e "${C_RED}⚠ Это самая рискованная операция в скрипте: при ошибке можно${C_RESET}"
+    echo -e "${C_RED}  НАВСЕГДА потерять доступ к серверу, если нет консоли у хостера.${C_RESET}"
+    echo ""
+
+    local target_user="${SUDO_USER:-root}"
+    local user_home
+    user_home=$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6)
+    user_home="${user_home:-/root}"
+    local akfile="$user_home/.ssh/authorized_keys"
+
+    echo -e "Проверяю авторизованные ключи для пользователя: ${C_GREEN}${target_user}${C_RESET}"
+    echo -e "${C_DIM}Файл: $akfile${C_RESET}"
+    echo ""
+
+    if [[ ! -s "$akfile" ]]; then
+        echo -e "${C_RED}✖ У пользователя $target_user нет ни одного авторизованного ключа.${C_RESET}"
+        echo -e "${C_YELLOW}Отключать пароль сейчас нельзя — ты потеряешь доступ.${C_RESET}"
+        echo ""
+        read -rp "$(echo -e "${C_BOLD}Добавить публичный ключ прямо сейчас? (y/N): ${C_RESET}")" ADD_KEY
+        if [[ ! "$ADD_KEY" =~ ^[YyДд]$ ]]; then
+            echo -e "${C_DIM}Отменено. Сначала добавь ключ (ssh-copy-id или вручную в $akfile), затем повтори.${C_RESET}"
+            pause
+            return
+        fi
+        echo -e "${C_DIM}Вставь строку публичного ключа целиком (начинается с ssh-ed25519 / ssh-rsa / ecdsa-...):${C_RESET}"
+        read -rp "> " PUBKEY
+        if [[ ! "$PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]]; then
+            echo -e "${C_RED}✖ Это не похоже на валидный публичный ключ. Отмена.${C_RESET}"
+            pause
+            return
+        fi
+        mkdir -p "$user_home/.ssh"
+        chmod 700 "$user_home/.ssh"
+        echo "$PUBKEY" >> "$akfile"
+        chmod 600 "$akfile"
+        chown -R "$target_user":"$target_user" "$user_home/.ssh" 2>/dev/null || true
+        echo -e "${C_GREEN}✔ Ключ добавлен в $akfile.${C_RESET}"
+    else
+        local keycount
+        keycount=$(grep -cE '^(ssh-|ecdsa-)' "$akfile" 2>/dev/null || echo 0)
+        echo -e "${C_GREEN}✔ Найдено ключей: $keycount${C_RESET}"
+    fi
+
+    echo ""
+    echo -e "${C_YELLOW}Прежде чем продолжить — убедись, что можешь ЗАРАНЕЕ, в новом окне терминала,${C_RESET}"
+    echo -e "${C_YELLOW}подключиться по этому ключу (например: ssh -i ~/.ssh/id_ed25519 ...).${C_RESET}"
+    read -rp "$(echo -e "${C_BOLD}Ты точно можешь подключиться ключом с другого терминала прямо сейчас? (y/N): ${C_RESET}")" SURE
+    if [[ ! "$SURE" =~ ^[YyДд]$ ]]; then
+        echo "Отменено — сначала проверь подключение по ключу."
+        pause
+        return
+    fi
+
+    local dropin_dir="/etc/ssh/sshd_config.d"
+    local dropin_file="$dropin_dir/99-relay-manager-keyonly.conf"
+    local sshd_conf="/etc/ssh/sshd_config"
+    local backup_conf="$BACKUP_DIR/sshd_config-$(date +%Y%m%d-%H%M%S).bak"
+    cp -a "$sshd_conf" "$backup_conf"
+
+    local use_dropin=0
+    if [[ -d "$dropin_dir" ]] && grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$sshd_conf" 2>/dev/null; then
+        use_dropin=1
+    fi
+
+    if (( use_dropin == 1 )); then
+        cat > "$dropin_file" << 'EOF'
+# Добавлено relay-manager: вход только по ключу
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+        echo -e "${C_GREEN}✔ Создан drop-in $dropin_file${C_RESET}"
+    else
+        echo -e "${C_YELLOW}⚠ Include для sshd_config.d не найден — правлю $sshd_conf напрямую.${C_RESET}"
+        sed -i -E 's/^#?[[:space:]]*PasswordAuthentication[[:space:]]+.*/PasswordAuthentication no/' "$sshd_conf"
+        grep -qE '^PasswordAuthentication[[:space:]]+no' "$sshd_conf" || echo "PasswordAuthentication no" >> "$sshd_conf"
+        sed -i -E 's/^#?[[:space:]]*(KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+.*/\1 no/' "$sshd_conf"
+    fi
+
+    local sshd_bin
+    sshd_bin=$(command -v sshd || echo /usr/sbin/sshd)
+    if ! "$sshd_bin" -t 2>/tmp/sshd-test.log; then
+        echo -e "${C_RED}✖ Конфигурация sshd невалидна, откатываю:${C_RESET}"
+        cat /tmp/sshd-test.log >&2
+        (( use_dropin == 1 )) && rm -f "$dropin_file"
+        cp -a "$backup_conf" "$sshd_conf"
+        pause
+        return
+    fi
+
+    local ssh_service="ssh"
+    systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service' && ssh_service="sshd"
+
+    echo -e "${C_YELLOW}⚙ Перезапускаю $ssh_service...${C_RESET}"
+    if ! systemctl restart "$ssh_service"; then
+        echo -e "${C_RED}✖ Не удалось перезапустить $ssh_service, откатываю.${C_RESET}"
+        (( use_dropin == 1 )) && rm -f "$dropin_file"
+        cp -a "$backup_conf" "$sshd_conf"
+        systemctl restart "$ssh_service" 2>/dev/null || true
+        pause
+        return
+    fi
+
+    local confirm_flag
+    confirm_flag=$(mktemp /tmp/ssh-hardening-XXXXXX)
+
+    (
+        sleep 90
+        if [[ -f "$confirm_flag" ]]; then
+            if (( use_dropin == 1 )); then
+                rm -f "$dropin_file"
+            else
+                cp -a "$backup_conf" "$sshd_conf"
+            fi
+            systemctl restart "$ssh_service" 2>/dev/null || true
+            rm -f "$confirm_flag"
+        fi
+    ) & disown
+
+    echo ""
+    echo -e "${C_RED}${C_BOLD}ВАЖНО: НЕ закрывай эту сессию!${C_RESET}"
+    echo -e "${C_YELLOW}Открой НОВЫЙ терминал прямо сейчас и попробуй подключиться по SSH ключом.${C_RESET}"
+    echo -e "${C_DIM}Если не подтвердить за 90 секунд — конфигурация откатится автоматически.${C_RESET}"
+    echo ""
+
+    local CONFIRM_ANS=""
+    read -t 80 -rp "$(echo -e "${C_BOLD}Подключение по ключу сработало? Напиши да, чтобы подтвердить: ${C_RESET}")" CONFIRM_ANS || true
+
+    if [[ "$CONFIRM_ANS" =~ ^([YyДд]|да|yes)$ ]]; then
+        rm -f "$confirm_flag"
+        echo -e "${C_GREEN}✔ Подтверждено. Вход по паролю отключён окончательно.${C_RESET}"
+    else
+        echo -e "${C_YELLOW}Не подтверждено вовремя — конфигурация будет автоматически откачена${C_RESET}"
+        echo -e "${C_YELLOW}фоновым таймером (если ещё не откатилась к этому моменту).${C_RESET}"
+    fi
+    pause
+}
+
 network_settings() {
     while true; do
         print_header
@@ -1203,16 +1354,25 @@ network_settings() {
         echo ""
         echo -e "SSH-порт: ${C_GREEN}$SSH_PORT${C_RESET}"
         echo -e "Публичный IP (SNAT): ${C_GREEN}${PUBLIC_IP:-не задан, MASQUERADE}${C_RESET}"
+        local pw_auth
+        pw_auth=$(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')
+        if [[ "$pw_auth" == "no" ]]; then
+            echo -e "Вход по паролю: ${C_GREEN}отключён (только ключ)${C_RESET}"
+        else
+            echo -e "Вход по паролю: ${C_YELLOW}разрешён${C_RESET}"
+        fi
         echo ""
         echo -e "${C_BOLD}Действия:${C_RESET}"
         echo -e " ${C_GREEN}1)${C_RESET} Изменить SSH-порт"
         echo -e " ${C_CYAN}2)${C_RESET} Изменить публичный IP"
+        echo -e " ${C_RED}3)${C_RESET} Отключить вход по паролю (только ключ)"
         echo -e " ${C_DIM}0)${C_RESET} Назад в меню"
         echo ""
-        read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-2]: ${C_RESET}")" NET_CHOICE
+        read -rp "$(echo -e "${C_BOLD}Выбери пункт [0-3]: ${C_RESET}")" NET_CHOICE
         case "$NET_CHOICE" in
             1) change_ssh_port ;;
             2) change_public_ip ;;
+            3) harden_ssh_key_only ;;
             0) return ;;
             *) echo -e "${C_RED}Неверный пункт.${C_RESET}"; sleep 1 ;;
         esac
