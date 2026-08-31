@@ -566,10 +566,20 @@ human_bytes() {
 
 # Суммирует пакеты/байты для конкретного порта+протокола из цепочки DNAT.
 # Печатает "PKTS BYTES" (0 0, если правило не найдено).
+# ВАЖНО: iptables -n печатает протокол ЧИСЛОМ (6=tcp, 17=udp), а не строкой —
+# сравнивать нужно с числом. Простое удаление -n не подходит: тогда известные
+# порты (443, 80...) печатаются именем сервиса ("https"), а не числом, и матчинг
+# по dpt:443 перестаёт находить правило вообще. Числовой протокол при -n — 
+# единственный вариант, где и порт, и протокол остаются однозначно числовыми.
 get_relay_counters() {
-    local lport="$1" proto="$2"
+    local lport="$1" proto="$2" proto_num
+    case "$proto" in
+        tcp) proto_num=6 ;;
+        udp) proto_num=17 ;;
+        *)   proto_num="$proto" ;;
+    esac
     iptables -t nat -L "$CHAIN_NAT_PRE" -n -v -x 2>/dev/null | \
-        awk -v port="$lport" -v proto="$proto" \
+        awk -v port="$lport" -v proto="$proto_num" \
             '$4 == proto && $0 ~ ("dpt:" port "( |$)") {pkts += $1; bytes += $2}
              END {print pkts+0, bytes+0}'
 }
@@ -748,7 +758,14 @@ delete_relay() {
     fi
 
     unset 'VALID_LINES[DEL_NUM-1]'
-    printf '%s\n' "${VALID_LINES[@]}" > "$RELAYS_FILE"
+    if (( ${#VALID_LINES[@]} > 0 )); then
+        printf '%s\n' "${VALID_LINES[@]}" > "$RELAYS_FILE"
+    else
+        # printf с пустым массивом всё равно один раз выполнит шаблон и оставит
+        # "призрачный" перевод строки — тогда [[ -s "$RELAYS_FILE" ]] по всему
+        # скрипту ошибочно считал бы, что relay ещё остались.
+        : > "$RELAYS_FILE"
+    fi
     echo -e "${C_GREEN}✔ Запись удалена.${C_RESET}"
     apply_relay_rules
     pause
@@ -852,9 +869,9 @@ install_xanmod() {
             ;;
     esac
 
-    if dpkg -l 2>/dev/null | grep -q '^ii  linux-image-.*xanmod'; then
+    if dpkg -l 2>/dev/null | grep -qE '^ii[[:space:]]+linux-image-.*xanmod'; then
         echo -e "${C_YELLOW}⚠ Похоже, XanMod-ядро уже установлено:${C_RESET}"
-        dpkg -l 2>/dev/null | awk '/^ii  linux-image-.*xanmod/{print "  "$2, $3}'
+        dpkg -l 2>/dev/null | awk '/^ii[[:space:]]+linux-image-.*xanmod/{print "  "$2, $3}'
         echo -e "${C_DIM}Повторная установка обновит его до последней версии в этой же ветке.${C_RESET}"
         echo ""
     fi
@@ -1235,7 +1252,7 @@ harden_ssh_key_only() {
         fi
         echo -e "${C_DIM}Вставь строку публичного ключа целиком (начинается с ssh-ed25519 / ssh-rsa / ecdsa-...):${C_RESET}"
         read -rp "> " PUBKEY
-        if [[ ! "$PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]]; then
+        if [[ ! "$PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-) ]]; then
             echo -e "${C_RED}✖ Это не похоже на валидный публичный ключ. Отмена.${C_RESET}"
             pause
             return
@@ -1248,7 +1265,7 @@ harden_ssh_key_only() {
         echo -e "${C_GREEN}✔ Ключ добавлен в $akfile.${C_RESET}"
     else
         local keycount
-        keycount=$(grep -cE '^(ssh-|ecdsa-)' "$akfile" 2>/dev/null || echo 0)
+        keycount=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$akfile" 2>/dev/null || echo 0)
         echo -e "${C_GREEN}✔ Найдено ключей: $keycount${C_RESET}"
     fi
 
@@ -1312,6 +1329,30 @@ EOF
         return
     fi
 
+    # Синтаксис — не гарантия эффекта. Если в sshd_config.d есть файл, который
+    # сортируется РАНЬШЕ нашего (например, 50-cloud-init.conf от хостера) и уже
+    # задаёт PasswordAuthentication yes — по правилу "первое совпадение побеждает"
+    # наш файл будет молча проигнорирован. Проверяем РЕАЛЬНЫЙ результат, а не
+    # сам факт успешной записи файла.
+    local effective_pw
+    effective_pw=$("$sshd_bin" -T 2>/dev/null | awk '/^passwordauthentication/{print $2}') || true
+    if [[ "$effective_pw" != "no" ]]; then
+        echo -e "${C_RED}✖ Пароль всё ещё разрешён на практике (sshd -T: passwordauthentication ${effective_pw:-?}),${C_RESET}"
+        echo -e "${C_RED}  хотя наш файл записан корректно. Скорее всего, другой файл в${C_RESET}"
+        echo -e "${C_RED}  $dropin_dir сортируется раньше и переопределяет это значение.${C_RESET}"
+        if (( use_dropin == 1 )) && [[ -d "$dropin_dir" ]]; then
+            local conflict
+            conflict=$(grep -lEi '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$dropin_dir"/*.conf 2>/dev/null | grep -v "$dropin_file" | head -3)
+            [[ -n "$conflict" ]] && echo -e "${C_YELLOW}  Похоже, виноват: ${conflict}${C_RESET}"
+        fi
+        echo -e "${C_DIM}  Откатываю наш файл — так безопаснее, чем оставлять ложное чувство защищённости.${C_RESET}"
+        (( use_dropin == 1 )) && rm -f "$dropin_file"
+        cp -a "$backup_conf" "$sshd_conf"
+        systemctl restart "$ssh_service" 2>/dev/null || true
+        pause
+        return
+    fi
+
     local confirm_flag
     confirm_flag=$(mktemp /tmp/ssh-hardening-XXXXXX)
 
@@ -1337,7 +1378,7 @@ EOF
     local CONFIRM_ANS=""
     read -t 80 -rp "$(echo -e "${C_BOLD}Подключение по ключу сработало? Напиши да, чтобы подтвердить: ${C_RESET}")" CONFIRM_ANS || true
 
-    if [[ "$CONFIRM_ANS" =~ ^([YyДд]|да|yes)$ ]]; then
+    if [[ "${CONFIRM_ANS,,}" =~ ^(y|yes|д|да)$ ]]; then
         rm -f "$confirm_flag"
         echo -e "${C_GREEN}✔ Подтверждено. Вход по паролю отключён окончательно.${C_RESET}"
     else
@@ -1354,8 +1395,9 @@ network_settings() {
         echo ""
         echo -e "SSH-порт: ${C_GREEN}$SSH_PORT${C_RESET}"
         echo -e "Публичный IP (SNAT): ${C_GREEN}${PUBLIC_IP:-не задан, MASQUERADE}${C_RESET}"
-        local pw_auth
-        pw_auth=$(sshd -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')
+        local pw_auth sshd_bin_check
+        sshd_bin_check=$(command -v sshd || echo /usr/sbin/sshd)
+        pw_auth=$("$sshd_bin_check" -T 2>/dev/null | awk '/^passwordauthentication/{print $2}')
         if [[ "$pw_auth" == "no" ]]; then
             echo -e "Вход по паролю: ${C_GREEN}отключён (только ключ)${C_RESET}"
         else
