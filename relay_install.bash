@@ -908,16 +908,22 @@ install_xanmod() {
     export DEBIAN_FRONTEND=noninteractive
     echo -e "${C_YELLOW}⚙ Добавляю официальный репозиторий XanMod...${C_RESET}"
     mkdir -p /usr/share/keyrings
-    if ! wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg; then
-        echo -e "${C_RED}✖ Не удалось получить GPG-ключ репозитория. Проверь сеть и повтори позже.${C_RESET}" >&2
+    # --yes — иначе gpg интерактивно спросит "перезаписать?", если ключ уже
+    # скачивался раньше (например, после неудачной предыдущей попытки), и
+    # неинтерактивный скрипт на этом просто зависнет или получит ошибку.
+    if ! wget -qO - https://dl.xanmod.org/archive.key | gpg --yes --batch --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg 2>/tmp/xanmod-gpg.log; then
+        echo -e "${C_RED}✖ Не удалось получить/сохранить GPG-ключ репозитория:${C_RESET}" >&2
+        tail -n 10 /tmp/xanmod-gpg.log >&2
         pause
         return
     fi
     echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" \
         > /etc/apt/sources.list.d/xanmod-release.list
 
-    if ! apt-get update -y > /dev/null 2>&1; then
+    if ! apt-get update -y > /tmp/xanmod-update.log 2>&1; then
         echo -e "${C_RED}✖ Не удалось обновить списки пакетов после добавления репозитория XanMod.${C_RESET}" >&2
+        echo -e "${C_RED}  Последние строки лога:${C_RESET}" >&2
+        tail -n 20 /tmp/xanmod-update.log >&2
         pause
         return
     fi
