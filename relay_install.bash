@@ -917,7 +917,19 @@ install_xanmod() {
         pause
         return
     fi
-    echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main" \
+    # Актуальная схема репозитория XanMod требует кодовое имя дистрибутива
+    # (noble, bookworm, trixie...), а не статичное "releases" — старая схема
+    # выдаёт 404, т.к. ветка releases больше не публикуется отдельно.
+    local xan_codename
+    xan_codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+    if [[ -z "$xan_codename" ]]; then
+        echo -e "${C_RED}✖ Не удалось определить кодовое имя дистрибутива (VERSION_CODENAME в /etc/os-release пусто).${C_RESET}" >&2
+        echo -e "${C_DIM}Поддерживаемые XanMod кодовые имена: bookworm, trixie, noble, plucky и т.д.${C_RESET}" >&2
+        pause
+        return
+    fi
+    echo -e "${C_DIM}Кодовое имя дистрибутива: ${xan_codename}${C_RESET}"
+    echo "deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${xan_codename} main" \
         > /etc/apt/sources.list.d/xanmod-release.list
 
     if ! apt-get update -y > /tmp/xanmod-update.log 2>&1; then
